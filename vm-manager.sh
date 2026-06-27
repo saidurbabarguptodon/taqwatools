@@ -3,11 +3,11 @@
 # Exit immediately if a command exits with a non-zero status
 set -e
 
-# Colors for a clean UI
-GREEN='\033;0;32m'
-BLUE='\033;0;34m'
-YELLOW='\033;1;33m'
-RED='\033;0;31m'
+# Colors for a clean UI (Fixed missing '[' bracket specifiers)
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 # Check for root privileges
