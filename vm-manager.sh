@@ -16,6 +16,16 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# Helper function to check if an APT package is installed
+is_pkg_installed() {
+    dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "ok installed"
+}
+
+# Helper function to check if a command binary exists
+is_cmd_installed() {
+    command -v "$1" &> /dev/null
+}
+
 # Function to draw the interface header with dynamic system info
 draw_banner() {
     clear
@@ -53,14 +63,58 @@ draw_banner() {
     echo -e "${BLUE}======================================================================${NC}"
 }
 
+# Smart Service Manager - Always forces execution into the background (bg)
+start_service_smart() {
+    local service_name=$1
+    echo -e "${BLUE}Managing $service_name startup...${NC}"
+
+    if systemctl status >/dev/null 2>&1; then
+        echo -e "${GREEN}systemctl detected. Restarting $service_name in background...${NC}"
+        systemctl restart "$service_name"
+        echo -e "${GREEN}✓ $service_name running in background via systemctl.${NC}"
+    elif command -v service &> /dev/null; then
+        echo -e "${YELLOW}systemctl absent. Using service wrapper in background...${NC}"
+        service "$service_name" start >/dev/null 2>&1 &
+        echo -e "${GREEN}✓ $service_name running in background via service tool.${NC}"
+    else
+        echo -e "${RED}Service managers missing! Forcing binary execution into the background...${NC}"
+        if [ "$service_name" = "ssh" ]; then
+            mkdir -p /var/run/sshd
+            $(command -v sshd) >/dev/null 2>&1 &
+        elif [ "$service_name" = "dropbear" ]; then
+            $(command -v dropbear) -R >/dev/null 2>&1 &
+        fi
+        echo -e "${GREEN}✓ Direct $service_name binary successfully pushed to background (bg).${NC}"
+    fi
+}
+
+# Smart Service Status Checker (Running / Stopped detection)
+check_status_smart() {
+    local service_name=$1
+    local proc_name=$service_name
+    if [ "$service_name" = "ssh" ]; then proc_name="sshd"; fi
+
+    echo -ne "${YELLOW}Service Status for [$service_name]: ${NC}"
+    if systemctl status >/dev/null 2>&1; then
+        if systemctl is-active --quiet "$service_name"; then
+            echo -e "${GREEN}RUNNING (via systemctl)${NC}"
+        else
+            echo -e "${RED}STOPPED (via systemctl)${NC}"
+        fi
+    else
+        if pgrep -x "$proc_name" >/dev/null; then
+            echo -e "${GREEN}RUNNING (Background Process)${NC}"
+        else
+            echo -e "${RED}STOPPED${NC}"
+        fi
+    fi
+}
+
 # Function to automatically inject OpenSSH Server custom configurations
 configure_openssh_server() {
     echo -e "${BLUE}Applying SSH Login & SFTP Settings...${NC}"
-    
-    # Back up the original config just in case
     cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.$(date +%s)
 
-    # Strip out existing instances of these settings to avoid duplicates/errors
     sed -i '/^PasswordAuthentication/d' /etc/ssh/sshd_config
     sed -i '/^PermitRootLogin/d' /etc/ssh/sshd_config
     sed -i '/^PubkeyAuthentication/d' /etc/ssh/sshd_config
@@ -69,7 +123,6 @@ configure_openssh_server() {
     sed -i '/^UsePAM/d' /etc/ssh/sshd_config
     sed -i '/^Subsystem[[:space:]]sftp/d' /etc/ssh/sshd_config
 
-    # Append your exact custom configuration block
     cat << 'EOF' >> /etc/ssh/sshd_config
 
 # SSH LOGIN SETTINGS
@@ -84,14 +137,11 @@ UsePAM yes
 Subsystem sftp /usr/lib/openssh/sftp-server
 EOF
 
-    # Restart SSH service to apply the updates live
-    echo -e "${BLUE}Restarting SSH daemon...${NC}"
-    systemctl restart ssh || service ssh restart
-    echo -e "${GREEN}✓ Custom configurations applied and SSH service restarted.${NC}"
+    start_service_smart "ssh"
 }
 
 # Function to safely handle Neofetch removal and OS-dependent Fastfetch installation
-install_fastfetch() {
+install_fastfetch_logic() {
     if command -v neofetch &> /dev/null; then
         echo -e "${YELLOW}Found legacy neofetch installed. Purging...${NC}"
         apt-get purge -y neofetch
@@ -104,117 +154,215 @@ install_fastfetch() {
 
     if apt-cache show fastfetch &> /dev/null; then
         echo -e "${GREEN}Fastfetch found in native OS repositories. Installing via apt...${NC}"
-        apt-get install -y fastfetch
+        apt-get install -y --reinstall fastfetch
     else
         echo -e "${YELLOW}Fastfetch not found in native repos. Downloading official GitHub release...${NC}"
-        
         local arch
         arch=$(dpkg --print-architecture)
-        
         if [ "$arch" != "amd64" ] && [ "$arch" != "arm64" ]; then
-            echo -e "${RED}Error: Unsupported architecture ($arch). Fastfetch GitHub releases support amd64 and arm64.${NC}"
+            echo -e "${RED}Error: Unsupported architecture ($arch).${NC}"
             return 1
         fi
-
         local url="https://github.com/fastfetch-cli/fastfetch/releases/latest/download/fastfetch-linux-${arch}.deb"
-        
-        echo -e "${BLUE}Downloading latest ${arch} package from GitHub...${NC}"
         cd /tmp
         wget -q --show-progress "$url" -O fastfetch.deb
-        
-        echo -e "${BLUE}Installing package...${NC}"
-        apt-get install -y ./fastfetch.deb
-        
+        apt-get install -y --reinstall ./fastfetch.deb
         rm fastfetch.deb
         cd - &> /dev/null
     fi
     echo -e "${GREEN}✓ Fastfetch setup complete.${NC}"
 }
 
-# Sub-Menu for Option 2 (OpenSSH)
+# Sub-Menu: Dropbear Management
+dropbear_menu() {
+    while true; do
+        draw_banner
+        if is_pkg_installed "dropbear"; then
+            echo -e "${YELLOW}>> Dropbear Manager (Installed):${NC}"
+            echo -e "1) Reinstall"
+            echo -e "2) Remove"
+            echo -e "3) Status (running/stop)"
+            echo -e "4) Back to Main Menu"
+            echo -ne "\nPlease select an option [1-4]: "
+            read -r choice
+            case $choice in
+                1)
+                    clear
+                    echo -e "${BLUE}running apt update${NC}"
+                    apt-get update -y
+                    echo -e "${BLUE}running apt install dropbear${NC}"
+                    apt-get install -y --reinstall dropbear
+                    echo -e "${GREEN}✓ Dropbear reinstalled successfully.${NC}"
+                    start_service_smart "dropbear"
+                    read -n 1 -s -r -p "Press any key to return..."
+                    ;;
+                2)
+                    clear
+                    echo -e "${RED}Removing Dropbear...${NC}"
+                    apt-get purge -y dropbear
+                    apt-get autoremove -y
+                    echo -e "${GREEN}✓ Dropbear successfully removed.${NC}"
+                    read -n 1 -s -r -p "Press any key to return..."
+                    break
+                    ;;
+                3)
+                    echo -e "\n"
+                    check_status_smart "dropbear"
+                    read -n 1 -s -r -p "Press any key to return..."
+                    ;;
+                4) break ;;
+                *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
+            esac
+        else
+            echo -e "${YELLOW}>> Dropbear Manager (Not Installed):${NC}"
+            echo -e "1) Install"
+            echo -e "2) Back to Main Menu"
+            echo -ne "\nPlease select an option [1-2]: "
+            read -r choice
+            case $choice in
+                1)
+                    clear
+                    echo -e "${BLUE}running apt update${NC}"
+                    apt-get update -y
+                    echo -e "${BLUE}running apt install dropbear${NC}"
+                    apt-get install -y dropbear
+                    echo -e "${GREEN}✓ Dropbear SSH installed successfully.${NC}"
+                    start_service_smart "dropbear"
+                    read -n 1 -s -r -p "Press any key to return..."
+                    ;;
+                2) break ;;
+                *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
+            esac
+        fi
+    done
+}
+
+# Sub-Menu: OpenSSH Management (Always Installs Both Server and Client)
 openssh_menu() {
     while true; do
         draw_banner
-        echo -e "${YELLOW}>> OpenSSH Installation Options:${NC}"
-        echo -e "1) Install Server"
-        echo -e "2) Install Client"
-        echo -e "3) Install Both"
-        echo -e "4) Back to Main Menu"
-        echo -ne "\nPlease select an option [1-4]: "
-        read -r ssh_choice
+        if is_pkg_installed "openssh-server"; then
+            echo -e "${YELLOW}>> OpenSSH Manager (Installed):${NC}"
+            echo -e "1) Reinstall"
+            echo -e "2) Remove"
+            echo -e "3) Status (running/stop)"
+            echo -e "4) Back to Main Menu"
+            echo -ne "\nPlease select an option [1-4]: "
+            read -r choice
+            case $choice in
+                1)
+                    clear
+                    echo -e "${BLUE}running apt update${NC}"
+                    apt-get update -y
+                    echo -e "${BLUE}running apt install openssh-server openssh-client${NC}"
+                    apt-get install -y --reinstall openssh-server openssh-client
+                    echo -e "${GREEN}✓ OpenSSH Suite reinstalled successfully.${NC}"
+                    configure_openssh_server
+                    read -n 1 -s -r -p "Press any key to return..."
+                    ;;
+                2)
+                    clear
+                    echo -e "${RED}Removing OpenSSH Server and Client...${NC}"
+                    apt-get purge -y openssh-server openssh-client
+                    apt-get autoremove -y
+                    echo -e "${GREEN}✓ OpenSSH Suite successfully removed.${NC}"
+                    read -n 1 -s -r -p "Press any key to return..."
+                    break
+                    ;;
+                3)
+                    echo -e "\n"
+                    check_status_smart "ssh"
+                    read -n 1 -s -r -p "Press any key to return..."
+                    ;;
+                4) break ;;
+                *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
+            esac
+        else
+            echo -e "${YELLOW}>> OpenSSH Manager (Not Installed):${NC}"
+            echo -e "1) Install"
+            echo -e "2) Back to Main Menu"
+            echo -ne "\nPlease select an option [1-2]: "
+            read -r choice
+            case $choice in
+                1)
+                    clear
+                    echo -e "${BLUE}running apt update${NC}"
+                    apt-get update -y
+                    echo -e "${BLUE}running apt install openssh-server openssh-client${NC}"
+                    apt-get install -y openssh-server openssh-client
+                    echo -e "${GREEN}✓ OpenSSH Suite installed successfully.${NC}"
+                    configure_openssh_server
+                    read -n 1 -s -r -p "Press any key to return..."
+                    ;;
+                2) break ;;
+                *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
+            esac
+        fi
+    done
+}
 
-        case $ssh_choice in
-            1)
-                clear
-                echo -e "${BLUE}running apt update${NC}"
-                apt-get update -y
-                echo -e "${BLUE}running apt install openssh-server${NC}"
-                apt-get install -y openssh-server
-                echo -e "${GREEN}✓ OpenSSH Server installed successfully.${NC}"
-                configure_openssh_server
-                read -n 1 -s -r -p "Press any key to return..."
-                ;;
-            2)
-                clear
-                echo -e "${BLUE}running apt update${NC}"
-                apt-get update -y
-                echo -e "${BLUE}running apt install openssh-client${NC}"
-                apt-get install -y openssh-client
-                echo -e "${GREEN}✓ OpenSSH Client installed successfully.${NC}"
-                read -n 1 -s -r -p "Press any key to return..."
-                ;;
-            3)
-                clear
-                echo -e "${BLUE}running apt update${NC}"
-                apt-get update -y
-                echo -e "${BLUE}running apt install openssh-server openssh-client${NC}"
-                apt-get install -y openssh-server openssh-client
-                echo -e "${GREEN}✓ OpenSSH Server and Client installed successfully.${NC}"
-                configure_openssh_server
-                read -n 1 -s -r -p "Press any key to return..."
-                ;;
-            4)
-                break 
-                ;;
-            *)
-                echo -e "${RED}Invalid selection. Please choose 1-4.${NC}"
-                sleep 1
-                ;;
-        esac
+# Sub-Menu: Fastfetch Management
+fastfetch_menu() {
+    while true; do
+        draw_banner
+        if is_cmd_installed "fastfetch"; then
+            echo -e "${YELLOW}>> Fastfetch Manager (Installed):${NC}"
+            echo -e "1) Reinstall"
+            echo -e "2) Remove"
+            echo -e "3) Back to Main Menu"
+            echo -ne "\nPlease select an option [1-3]: "
+            read -r choice
+            case $choice in
+                1)
+                    clear
+                    install_fastfetch_logic
+                    read -n 1 -s -r -p "Press any key to return..."
+                    ;;
+                2)
+                    clear
+                    echo -e "${RED}Removing Fastfetch...${NC}"
+                    apt-get purge -y fastfetch || true
+                    if [ -f /usr/local/bin/fastfetch ]; then rm -f /usr/local/bin/fastfetch; fi
+                    echo -e "${GREEN}✓ Fastfetch successfully removed.${NC}"
+                    read -n 1 -s -r -p "Press any key to return..."
+                    break
+                    ;;
+                3) break ;;
+                *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
+            esac
+        else
+            echo -e "${YELLOW}>> Fastfetch Manager (Not Installed):${NC}"
+            echo -e "1) Install"
+            echo -e "2) Back to Main Menu"
+            echo -ne "\nPlease select an option [1-2]: "
+            read -r choice
+            case $choice in
+                1)
+                    clear
+                    install_fastfetch_logic
+                    read -n 1 -s -r -p "Press any key to return..."
+                    ;;
+                2) break ;;
+                *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
+            esac
+        fi
     done
 }
 
 # Main Application Menu Loop
 while true; do
     draw_banner
-    echo -e "1) Install Dropbear"
-    echo -e "2) Install OpenSSH"
-    echo -e "3) Install Fastfetch"
+    echo -e "1) Dropbear"
+    echo -e "2) OpenSSH"
+    echo -e "3) Fastfetch"
     echo -e "4) Exit Tool"
     echo -ne "\nPlease select an option [1-4]: "
     read -r main_choice
 
     case $main_choice in
-        1)
-            # Clears terminal, displays specific user output strings, installs dropbear
-            clear
-            echo -e "${BLUE}running apt update${NC}"
-            apt-get update -y
-            
-            echo -e "${BLUE}running apt install dropbear${NC}"
-            apt-get install -y dropbear
-            
-            echo -e "${GREEN}✓ Dropbear SSH installed successfully.${NC}"
-            read -n 1 -s -r -p "Press any key to return..."
-            ;;
-        2)
-            openssh_menu
-            ;;
-        3)
-            clear
-            install_fastfetch
-            read -n 1 -s -r -p "Press any key to return..."
-            ;;
+        1) dropbear_menu ;;
+        2) openssh_menu ;;
+        3) fastfetch_menu ;;
         4)
             echo -e "\n${GREEN}Exiting VPS/VM Setup. Goodbye!${NC}\n"
             exit 0
