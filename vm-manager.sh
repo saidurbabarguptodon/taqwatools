@@ -4,10 +4,10 @@
 set -e
 
 # Colors for a clean UI
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
+GREEN='\033;0;32m'
+BLUE='\033;0;34m'
+YELLOW='\033;1;33m'
+RED='\033;0;31m'
 NC='\033[0m' # No Color
 
 # Check for root privileges
@@ -51,47 +51,62 @@ draw_banner() {
     local cpu_load
     cpu_load=$(uptime | awk -F'load average:' '{print $2}' | sed 's/^[ \t]*//')
 
+    # 5. Fetch System Virtualization Type
+    local sys_type="Bare-metal"
+    if command -v systemd-detect-virt &> /dev/null; then
+        sys_type=$(systemd-detect-virt 2>/dev/null || echo "Bare-metal")
+    elif [ -d /proc/vz ]; then
+        sys_type="OpenVZ"
+    elif [ -f /.dockerenv ]; then
+        sys_type="Docker"
+    fi
+    # Capitalize first letter for visual clean output
+    sys_type=$(echo "$sys_type" | awk '{print toupper(substr($0,1,1))substr($0,2)}')
+
+    # 6. Detect Systemctl Operational Support Status
+    local systemctl_support="No"
+    if [ -d /run/systemd/system ] && command -v systemctl &> /dev/null; then
+        systemctl_support="Yes"
+    fi
+
     # Print the Header Dashboard
     echo -e "${BLUE}======================================================================${NC}"
     echo -e "${GREEN}                           VPS/VM Setup                               ${NC}"
     echo -e "${BLUE}======================================================================${NC}"
     echo -e "${YELLOW}SYSTEM CONFIGURATION & METRICS:${NC}"
-    echo -e "  OS:   $os_version"
-    echo -e "  CPU:  $cpu_model (Load: $cpu_load)"
-    echo -e "  RAM:  $ram_info"
-    echo -e "  Disk: $disk_info"
+    echo -e "  OS:                $os_version"
+    echo -e "  System Type:       $sys_type"
+    echo -e "  Systemctl Support: $systemctl_support"
+    echo -e "  CPU:               $cpu_model (Load: $cpu_load)"
+    echo -e "  RAM:               $ram_info"
+    echo -e "  Disk:              $disk_info"
     echo -e "${BLUE}======================================================================${NC}"
 }
 
-# Smart Service Manager - Immune to degraded state systemctl failures
+# Smart Service Manager - Systemctl fallback directly to Background Built-in Binary
 start_service_smart() {
     local service_name=$1
     echo -e "${BLUE}Managing $service_name startup...${NC}"
 
-    # Bulletproof check for systemd environment via kernel directory layout
     if [ -d /run/systemd/system ]; then
         echo -e "${GREEN}Systemd environment verified. Starting $service_name...${NC}"
         systemctl unmask "$service_name" 2>/dev/null || true
         systemctl daemon-reload
         systemctl restart "$service_name"
         echo -e "${GREEN}✓ $service_name managed successfully via systemctl.${NC}"
-    elif command -v service &> /dev/null; then
-        echo -e "${YELLOW}Systemd absent. Using service wrapper in background...${NC}"
-        service "$service_name" start >/dev/null 2>&1 &
-        echo -e "${GREEN}✓ $service_name running in background via service tool.${NC}"
     else
-        echo -e "${RED}Service managers missing! Forcing binary execution into background...${NC}"
+        echo -e "${YELLOW}Systemd absent. Forcing built-in binary execution into background...${NC}"
         if [ "$service_name" = "ssh" ]; then
             mkdir -p /var/run/sshd
             $(command -v sshd) >/dev/null 2>&1 &
         elif [ "$service_name" = "dropbear" ]; then
             $(command -v dropbear) -R >/dev/null 2>&1 &
         fi
-        echo -e "${GREEN}✓ Direct $service_name binary successfully pushed to background (bg).${NC}"
+        echo -e "${GREEN}✓ Direct built-in $service_name binary running in background (bg).${NC}"
     fi
 }
 
-# Upgraded Dual-Layer Service Status Checker (Systemd + PID verification)
+# Strict Status Checker - Checks ONLY systemctl or the running built-in binary process
 check_status_smart() {
     local service_name=$1
     local proc_name=$service_name
@@ -99,15 +114,21 @@ check_status_smart() {
 
     echo -ne "${YELLOW}Service Status for [$service_name]: ${NC}"
     
-    # 1. Physical Memory Check: Is the process actively allocated in the OS process tree?
-    if pgrep -x "$proc_name" >/dev/null; then
-        echo -e "${GREEN}RUNNING (Active Process)${NC}"
-    # 2. Systemd Check: Fallback validation layer
-    elif [ -d /run/systemd/system ] && systemctl is-active --quiet "$service_name"; then
-        echo -e "${GREEN}RUNNING (via systemctl)${NC}"
-    else
-        echo -e "${RED}STOPPED${NC}"
+    # 1. Try systemctl engine
+    if [ -d /run/systemd/system ]; then
+        if systemctl is-active --quiet "$service_name" 2>/dev/null; then
+            echo -e "${GREEN}RUNNING (via systemctl)${NC}"
+            return 0
+        fi
     fi
+
+    # 2. Try raw built-in binary process engine
+    if pgrep -x "$proc_name" >/dev/null; then
+        echo -e "${GREEN}RUNNING (via built-in binary)${NC}"
+        return 0
+    fi
+
+    echo -e "${RED}STOPPED${NC}"
 }
 
 # Function to automatically inject OpenSSH Server custom configurations
