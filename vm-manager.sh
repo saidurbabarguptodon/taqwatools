@@ -63,21 +63,24 @@ draw_banner() {
     echo -e "${BLUE}======================================================================${NC}"
 }
 
-# Smart Service Manager - Always forces execution into the background (bg)
+# Smart Service Manager - Immune to degraded state systemctl failures
 start_service_smart() {
     local service_name=$1
     echo -e "${BLUE}Managing $service_name startup...${NC}"
 
-    if systemctl status >/dev/null 2>&1; then
-        echo -e "${GREEN}systemctl detected. Restarting $service_name in background...${NC}"
+    # Bulletproof check for systemd environment via kernel directory layout
+    if [ -d /run/systemd/system ]; then
+        echo -e "${GREEN}Systemd environment verified. Starting $service_name...${NC}"
+        systemctl unmask "$service_name" 2>/dev/null || true
+        systemctl daemon-reload
         systemctl restart "$service_name"
-        echo -e "${GREEN}✓ $service_name running in background via systemctl.${NC}"
+        echo -e "${GREEN}✓ $service_name managed successfully via systemctl.${NC}"
     elif command -v service &> /dev/null; then
-        echo -e "${YELLOW}systemctl absent. Using service wrapper in background...${NC}"
+        echo -e "${YELLOW}Systemd absent. Using service wrapper in background...${NC}"
         service "$service_name" start >/dev/null 2>&1 &
         echo -e "${GREEN}✓ $service_name running in background via service tool.${NC}"
     else
-        echo -e "${RED}Service managers missing! Forcing binary execution into the background...${NC}"
+        echo -e "${RED}Service managers missing! Forcing binary execution into background...${NC}"
         if [ "$service_name" = "ssh" ]; then
             mkdir -p /var/run/sshd
             $(command -v sshd) >/dev/null 2>&1 &
@@ -88,25 +91,22 @@ start_service_smart() {
     fi
 }
 
-# Smart Service Status Checker (Running / Stopped detection)
+# Upgraded Dual-Layer Service Status Checker (Systemd + PID verification)
 check_status_smart() {
     local service_name=$1
     local proc_name=$service_name
     if [ "$service_name" = "ssh" ]; then proc_name="sshd"; fi
 
     echo -ne "${YELLOW}Service Status for [$service_name]: ${NC}"
-    if systemctl status >/dev/null 2>&1; then
-        if systemctl is-active --quiet "$service_name"; then
-            echo -e "${GREEN}RUNNING (via systemctl)${NC}"
-        else
-            echo -e "${RED}STOPPED (via systemctl)${NC}"
-        fi
+    
+    # 1. Physical Memory Check: Is the process actively allocated in the OS process tree?
+    if pgrep -x "$proc_name" >/dev/null; then
+        echo -e "${GREEN}RUNNING (Active Process)${NC}"
+    # 2. Systemd Check: Fallback validation layer
+    elif [ -d /run/systemd/system ] && systemctl is-active --quiet "$service_name"; then
+        echo -e "${GREEN}RUNNING (via systemctl)${NC}"
     else
-        if pgrep -x "$proc_name" >/dev/null; then
-            echo -e "${GREEN}RUNNING (Background Process)${NC}"
-        else
-            echo -e "${RED}STOPPED${NC}"
-        fi
+        echo -e "${RED}STOPPED${NC}"
     fi
 }
 
@@ -237,7 +237,7 @@ dropbear_menu() {
     done
 }
 
-# Sub-Menu: OpenSSH Management (Always Installs Both Server and Client)
+# Sub-Menu: OpenSSH Management
 openssh_menu() {
     while true; do
         draw_banner
